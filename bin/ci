@@ -68,7 +68,7 @@ require_definitions() {
 lint_syntax() {
   heading "Syntax" "bash -n over scripts and definitions"
   local f
-  for f in bin/ci test/build test/lint $(definitions); do
+  for f in bin/ci bin/portable bin/portable-build test/build test/lint $(definitions); do
     if bash -n "$f" 2>/dev/null; then pass "$f"; else fail "$f has a syntax error"; bash -n "$f" || true; fi
   done
 }
@@ -204,7 +204,7 @@ lint_shellcheck() {
   # find on version-numbered filenames, deliberate word splitting). Gating on info
   # would mean either noisy failures or a scattering of disable comments, and both
   # train people to ignore the step.
-  if shellcheck -s bash --severity=warning bin/ci test/build test/lint; then
+  if shellcheck -s bash --severity=warning bin/ci bin/portable bin/portable-build test/build test/lint; then
     pass "scripts"
   else
     fail "shellcheck"

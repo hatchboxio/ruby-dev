@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# Build a relocatable Ruby from one of this repo's definitions, jdx/ruby style.
+#
+# Runs on the Linux it is building for — bin/portable puts it in a container. It reads the
+# definition for everything that is Ruby-version specific (source URL and checksum, OpenSSL
+# version, compiler flags, configure options, which bundlers to install), so the portable
+# build can't drift from the ruby-build one. What it adds is portability:
+#
+#   - --enable-load-relative, so the prefix is found from the executable at run time and
+#     the tree can be extracted anywhere.
+#   - OpenSSL, zlib, libyaml, and libffi compiled statically into the prefix, so the result
+#     depends on nothing but glibc. Extensions that would drag in a system library nothing
+#     guarantees (gdbm, readline, tk) are left out; `require "readline"` still works, 2.7's
+#     readline.rb falls back to reline.
+#   - rbconfig.rb rewritten to refer to the relocated prefix, and the dependencies' headers
+#     and static libs copied in, so native gems build after relocation.
+#   - OpenSSL configured with --openssldir=/etc/ssl so it uses the system CA store, with a
+#     bundled CA file as a fallback for hosts that have none.
+#
+#   bin/portable-build <version> <output-dir>
+set -euo pipefail
+
+version=${1:?usage: bin/portable-build <version> <output-dir>}
+out=${2:?usage: bin/portable-build <version> <output-dir>}
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+definition="$ROOT/$version"
+[ -f "$definition" ] || { echo "error: no definition for $version in $ROOT" >&2; exit 1; }
+[ "$(uname -s)" = Linux ] || { echo "error: portable builds are Linux only; use bin/portable" >&2; exit 1; }
+
+MAKE_JOBS=${MAKE_JOBS:-$(nproc)}
+platform=${PORTABLE_PLATFORM:-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')_linux}
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+SRC="$WORK/src"; DEPS="$WORK/deps"; PACKAGE="$WORK/package"
+PREFIX="$PACKAGE/ruby-$version"
+mkdir -p "$SRC" "$DEPS" "$PACKAGE" "$out"
+
+log() { printf '\n==> %s\n' "$*"; }
+
+# --- Read the definition ------------------------------------------------------------
+# Source it with ruby-build's entry points stubbed out to record instead of build. The
+# definition's own install_bundler runs "$PREFIX_PATH"/bin/gem, so point PREFIX_PATH at a
+# fake gem that records its arguments; the real installs happen after Ruby is built.
+RUBY_SOURCE=""; OPENSSL_SOURCE=""
+CONFIGURE_OPTS=()
+install_package() {
+  case $1 in
+    ruby-*)    RUBY_SOURCE=$2 ;;
+    openssl-*) OPENSSL_SOURCE=$2 ;;
+  esac
+}
+package_option() {
+  [ "$1 $2" = "ruby configure" ] || return 0
+  shift 2
+  CONFIGURE_OPTS+=("$@")
+}
+require_gcc() { :; }
+PREFIX_PATH="$WORK/fake-prefix"
+mkdir -p "$PREFIX_PATH/bin"
+printf '#!/bin/sh\necho "$@" >> "%s"\n' "$WORK/gem-installs" > "$PREFIX_PATH/bin/gem"
+chmod +x "$PREFIX_PATH/bin/gem"
+set +u
+# shellcheck disable=SC1090
+. "$definition"
+set -u
+[ -n "$RUBY_SOURCE" ] || { echo "error: $definition installs no ruby package" >&2; exit 1; }
+[ -n "$OPENSSL_SOURCE" ] || { echo "error: $definition installs no openssl package" >&2; exit 1; }
+[ -n "${RUBY_CFLAGS:-}" ] || { echo "error: $definition sets no RUBY_CFLAGS" >&2; exit 1; }
+
+# --- Sources ------------------------------------------------------------------------
+# Portable dependencies. Versions and checksums follow jdx/ruby's recipes/dependencies.yml.
+ZLIB_SOURCE="https://zlib.net/fossils/zlib-1.3.1.tar.gz#9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+LIBYAML_SOURCE="https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz#c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4"
+LIBFFI_SOURCE="https://github.com/libffi/libffi/releases/download/v3.5.1/libffi-3.5.1.tar.gz#f99eb68a67c7d54866b7706af245e87ba060d419a062474b456d3bc8d4abdbd1"
+CACERT_SOURCE="https://curl.se/ca/cacert-2025-07-15.pem#7430e90ee0cdca2d0f02b1ece46fbf255d5d0408111f009638e3b892d6ca089c"
+
+# fetch <url#sha256> — downloads into $SRC, verifies, prints the path.
+fetch() {
+  local url=${1%%#*} sha=${1##*#} file
+  file="$SRC/$(basename "$url")"
+  curl -fsSL --retry 3 -o "$file" "$url"
+  echo "$sha  $file" | sha256sum -c --quiet - || { echo "error: checksum mismatch for $url" >&2; exit 1; }
+  echo "$file"
+}
+
+# unpack <archive> — extracts into $SRC and prints the single top-level directory.
+unpack() {
+  local dir
+  dir=$(tar -tf "$1" | head -1 | cut -d/ -f1)
+  tar -xf "$1" -C "$SRC"
+  echo "$SRC/$dir"
+}
+
+# --- Dependencies, static and position-independent -----------------------------------
+# -fPIC because these get linked into Ruby's shared extensions. -std=gnu11 because these
+# are modern enough not to need Ruby's own flag soup but not all of them have met a C23
+# compiler yet.
+DEP_CFLAGS="-O2 -fPIC -std=gnu11"
+
+log "zlib"
+dir=$(unpack "$(fetch "$ZLIB_SOURCE")")
+( cd "$dir" && CFLAGS="$DEP_CFLAGS" ./configure --static --prefix="$DEPS" && make -j"$MAKE_JOBS" && make install )
+
+log "libyaml"
+dir=$(unpack "$(fetch "$LIBYAML_SOURCE")")
+( cd "$dir" && CFLAGS="$DEP_CFLAGS" ./configure --prefix="$DEPS" --enable-static --disable-shared --disable-dependency-tracking \
+  && make -j"$MAKE_JOBS" && make install )
+
+log "libffi"
+dir=$(unpack "$(fetch "$LIBFFI_SOURCE")")
+( cd "$dir" && CFLAGS="$DEP_CFLAGS" ./configure --prefix="$DEPS" --libdir="$DEPS/lib" --enable-static --disable-shared \
+  --disable-docs --disable-dependency-tracking && make -j"$MAKE_JOBS" && make install )
+
+log "openssl"
+dir=$(unpack "$(fetch "$OPENSSL_SOURCE")")
+# --openssldir=/etc/ssl: the certificate store is the one thing that must not be bundled
+# blindly, so point at the system's. /etc/ssl/certs is where Debian and Ubuntu keep it.
+( cd "$dir" && ./config --prefix="$DEPS" --openssldir=/etc/ssl --libdir=lib no-shared no-ssl2 no-ssl3 no-comp $DEP_CFLAGS \
+  && make -j"$MAKE_JOBS" && make install_sw )
+
+# --- Ruby ---------------------------------------------------------------------------
+log "ruby $version"
+dir=$(unpack "$(fetch "$RUBY_SOURCE")")
+
+# Fold every --with-out-ext from the definition together with ours: Ruby's configure keeps
+# only the last one it sees.
+out_exts="readline,gdbm,dbm,tk,tcl,win32,win32ole"
+opts=()
+for opt in "${CONFIGURE_OPTS[@]}"; do
+  case $opt in
+    --with-out-ext=*) out_exts="${opt#--with-out-ext=},$out_exts" ;;
+    *) opts+=("$opt") ;;
+  esac
+done
+
+( cd "$dir" && \
+  PKG_CONFIG_PATH="$DEPS/lib/pkgconfig" CFLAGS="$RUBY_CFLAGS" \
+  ./configure --prefix="$PREFIX" --enable-load-relative --without-gmp \
+    --with-opt-dir="$DEPS" --with-openssl-dir="$DEPS" --with-out-ext="$out_exts" "${opts[@]}" \
+  && make -j"$MAKE_JOBS" && make install )
+
+# --- Make it relocatable ------------------------------------------------------------
+log "relocating rbconfig and bundling dependencies"
+rbconfig=$(find "$PREFIX/lib/ruby" -name rbconfig.rb -path '*/lib/ruby/[0-9]*' | head -1)
+[ -n "$rbconfig" ] || { echo "error: rbconfig.rb not found under $PREFIX" >&2; exit 1; }
+
+# Dependency headers and static libs move into the prefix, and every reference to the
+# build-time dependency directory becomes $(prefix), which rbconfig expands at run time.
+mkdir -p "$PREFIX/include" "$PREFIX/lib/pkgconfig"
+cp -R "$DEPS/include/." "$PREFIX/include/"
+cp "$DEPS"/lib/*.a "$PREFIX/lib/"
+cp "$DEPS"/lib/pkgconfig/*.pc "$PREFIX/lib/pkgconfig/"
+# pkg-config files say where things are in absolute terms; make that relative to the file.
+sed -i "s|$DEPS|\${pcfiledir}/../..|g; s|$PREFIX|\${pcfiledir}/../..|g" "$PREFIX"/lib/pkgconfig/*.pc
+sed -i "s|$DEPS|\$(prefix)|g" "$rbconfig"
+cat >> "$rbconfig" <<'RUBY'
+
+# Portable build: let pkg-config find the bundled dependencies when native gems build.
+module RbConfig
+  pkgconfig = File.join(CONFIG["prefix"], "lib", "pkgconfig")
+  ENV["PKG_CONFIG_PATH"] = [pkgconfig, ENV["PKG_CONFIG_PATH"]].compact.reject(&:empty?).join(File::PATH_SEPARATOR)
+end
+RUBY
+
+# CA fallback: OpenSSL looks in /etc/ssl/certs. A host without ca-certificates gets the
+# bundled file instead, but only then — the system store wins whenever it exists.
+mkdir -p "$PREFIX/libexec"
+cp "$(fetch "$CACERT_SOURCE")" "$PREFIX/libexec/cert.pem"
+openssl_rb=$(find "$PREFIX/lib/ruby" -maxdepth 2 -name openssl.rb | head -1)
+[ -n "$openssl_rb" ] || { echo "error: openssl.rb not found under $PREFIX" >&2; exit 1; }
+"$PREFIX/bin/ruby" - "$openssl_rb" <<'RUBY'
+path = ARGV[0]
+source = File.read(path)
+needle = "require 'openssl.so'"
+abort "#{path}: expected exactly one require of openssl.so" unless source.scan(needle).size == 1
+source.sub!(needle, <<~'FALLBACK'.chomp)
+  if ENV["SSL_CERT_FILE"].to_s.empty? && ENV["SSL_CERT_DIR"].to_s.empty? &&
+     !File.exist?("/etc/ssl/certs/ca-certificates.crt") && !Dir.exist?("/etc/ssl/certs")
+    bundled = File.expand_path("../../libexec/cert.pem", RbConfig.ruby)
+    ENV["SSL_CERT_FILE"] = bundled if File.exist?(bundled)
+  end
+  require 'openssl.so'
+FALLBACK
+File.write(path, source)
+RUBY
+
+# --- Executable stubs -----------------------------------------------------------------
+# Two problems with bin/* and RubyGems 3.1 (2.7's), both fixed by rewriting the stubs.
+#
+# Ruby's own installer knows about --enable-load-relative and writes bin/bundle, bin/irb
+# etc. as sh/ruby polyglots that exec "${0%/*}/ruby". RubyGems does not: `gem install`
+# writes "#!<build prefix>/bin/ruby", which breaks the moment the tree moves. Those get
+# the same polyglot prolog Ruby's installer uses.
+#
+# And RubyGems' overwrite check reads only the first three lines of an existing stub,
+# expecting its own marker on line three. In a polyglot that line is code, so installing
+# any gem whose executable already exists (bundler, most obviously) is refused as a
+# conflict. Inserting the marker right after the shebang satisfies it; sh and ruby -x both
+# ignore the extra comment.
+patch_executables() {
+  "$PREFIX/bin/ruby" - "$PREFIX/bin" "$PREFIX/bin/ruby" <<'RUBY'
+bindir, build_ruby = ARGV
+# Built from lines, not a heredoc: a backslash-newline gets joined in a squiggly heredoc,
+# and the "_=_\" continuation is what makes the polyglot parse in sh.
+prolog = [
+  "#!/bin/sh",
+  "# -*- ruby -*-",
+  "_=_\\",
+  "=begin",
+  'bindir="${0%/*}"',
+  'exec "$bindir/ruby" "-x" "$0" "$@"',
+  "=end",
+  ""
+].join("\n")
+marker = "#\n# This file was generated by RubyGems.\n"
+Dir.children(bindir).sort.each do |name|
+  path = File.join(bindir, name)
+  next unless File.file?(path)
+  source = File.binread(path)
+  next unless source.start_with?("#!")
+  source = source.sub(/\A#!#{Regexp.escape(build_ruby)}\S*[^\n]*\n/) { prolog + "#!/usr/bin/env ruby\n" }
+  if source.start_with?("#!/bin/sh\n") && source.include?("This file was generated by RubyGems") &&
+     source.lines[2] !~ /This file was generated by RubyGems/
+    source = source.sub("\n", "\n" + marker)
+  end
+  File.binwrite(path, source)
+end
+RUBY
+}
+
+log "patching executable stubs"
+patch_executables
+
+# --- Bundler, as the definition asked for -------------------------------------------
+if [ -f "$WORK/gem-installs" ]; then
+  while read -r args; do
+    log "gem $args"
+    # shellcheck disable=SC2086
+    "$PREFIX/bin/gem" $args --no-document
+  done < "$WORK/gem-installs"
+  patch_executables
+fi
+
+# --- Prove it is portable -------------------------------------------------------------
+# Nothing in the tree may link a library that isn't part of glibc.
+log "checking shared library dependencies"
+allowed='^(linux-vdso|ld-linux[^ ]*|libc|libm|libpthread|libdl|librt|libcrypt|libgcc_s|libresolv|libutil)\.so'
+bad=0
+while IFS= read -r file; do
+  while read -r lib _; do
+    [[ ${lib##*/} =~ $allowed ]] && continue
+    echo "  ✗ $file needs $lib"; bad=1
+  done < <(ldd "$file" 2>/dev/null | awk '/=>|linux-vdso|ld-linux/ {print $1}')
+done < <(find "$PREFIX/bin" "$PREFIX/lib/ruby" -type f \( -name '*.so' -o -perm -u+x \) -exec sh -c 'head -c 4 "$1" | tr -d "\177" | grep -q "^ELF$"' _ {} \; -print)
+[ $bad -eq 0 ] || { echo "error: not portable" >&2; exit 1; }
+
+# And no text file but rbconfig.rb may mention where it was built. rbconfig keeps the
+# original prefix as the fallback for when it can't locate itself, which is harmless and
+# upstream. Binaries are skipped: they carry the build path in debug info, nothing more.
+grep -rlI "$WORK" "$PREFIX" 2>/dev/null | grep -v '/rbconfig\.rb$' | sed 's/^/  ✗ build path leaked into /' > "$WORK/leaks" || true
+cat "$WORK/leaks"
+[ ! -s "$WORK/leaks" ] || { echo "error: build paths leaked into the package" >&2; exit 1; }
+
+# --- Package ------------------------------------------------------------------------
+artifact="$out/ruby-$version.$platform.tar.gz"
+log "packaging $artifact"
+tar -C "$PACKAGE" -czf "$artifact" "ruby-$version"
+ls -la "$artifact"

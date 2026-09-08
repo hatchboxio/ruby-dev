@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Build a relocatable Ruby tarball in a clean container, then prove it relocates.
+#
+#   bin/portable 2.7.8 ubuntu-resolute-arm64      # -> dist/ruby-2.7.8.ubuntu-resolute-arm64.tar.gz
+#   bin/portable 2.7.8 ubuntu-resolute-amd64
+#
+# The build happens in the same image test/build uses for that platform, via
+# bin/portable-build. The check happens somewhere much less friendly: a fresh ubuntu image
+# with a compiler and nothing else — no -dev packages, no ca-certificates — where the
+# tarball is extracted to a random path and asked to load every bundled extension, fetch
+# an https URL, and compile a native gem. If that passes, the tarball is portable.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+version=${1:-}
+platform=${2:-}
+[ -n "$version" ] && [ -n "$platform" ] || { sed -n '2,6p' "$0" | cut -c3-; exit 1; }
+[ -f "$version" ] || { echo "error: unknown version: $version" >&2; exit 1; }
+
+case $platform in
+  *-amd64) target=linux/amd64 ;;
+  *-arm64) target=linux/arm64 ;;
+  *) echo "error: platform must end in -amd64 or -arm64 (e.g. ubuntu-resolute-arm64)" >&2; exit 1 ;;
+esac
+dockerfile="test/${platform%-*}.dockerfile"
+[ -f "$dockerfile" ] || { echo "error: no $dockerfile" >&2; exit 1; }
+base=$(sed -n 's/^FROM //p' "$dockerfile" | head -1)
+
+image="ruby-build-test:$platform"
+dist="$PWD/dist"
+mkdir -p "$dist"
+artifact="ruby-$version.$platform.tar.gz"
+MAKE_JOBS=${MAKE_JOBS:-4}
+
+echo "Building $image..."
+docker buildx build --platform "$target" -f "$dockerfile" -t "$image" --load . >/dev/null 2>&1 \
+  || { echo "error: image build failed for $platform" >&2; exit 1; }
+
+echo "Building $artifact (make -j$MAKE_JOBS)..."
+docker run --rm --platform "$target" \
+  -v "$PWD:/src:ro" -v "$dist:/dist" \
+  -e MAKE_JOBS="$MAKE_JOBS" -e PORTABLE_PLATFORM="$platform" \
+  "$image" /src/bin/portable-build "$version" /dist
+
+# Ruby version to expect, e.g. 2.7.8 from 2.7.8 or 2.0.0 from 2.0.0-p648.
+expect=${version%%-*}
+
+echo "Verifying $artifact in a fresh $base container..."
+docker run --rm --platform "$target" -v "$dist:/dist:ro" "$base" bash -c '
+  set -e
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq >/dev/null && apt-get install -y -qq build-essential >/dev/null
+  dir=/opt/somewhere/unexpected/$RANDOM
+  mkdir -p "$dir" && tar -xzf /dist/'"$artifact"' -C "$dir"
+  ruby="$dir/ruby-'"$version"'/bin/ruby"
+  "$ruby" --version
+  "$ruby" -e "abort \"wrong version: #{RUBY_VERSION}\" unless RUBY_VERSION == \"'"$expect"'\""
+  "$ruby" -e "abort \"RbConfig.ruby is #{RbConfig.ruby}\" unless RbConfig.ruby == \"$ruby\""
+  "$ruby" -e "require \"openssl\"; puts \"openssl: #{OpenSSL::OPENSSL_LIBRARY_VERSION}\""
+  "$ruby" -ropen-uri -e "URI.open(\"https://rubygems.org/\") { |f| abort \"https: #{f.status.join(\" \")}\" unless f.status.first == \"200\" }; puts \"https: ok (no system CA store here, so that was the bundled one)\""
+  "$ruby" -rzlib -e "abort \"zlib\" unless Zlib.crc32(\"test\") == 3632233996; puts \"zlib: ok\""
+  "$ruby" -ryaml -e "abort \"yaml\" unless YAML.load(\"a: b\") == {\"a\" => \"b\"}; puts \"yaml: ok\""
+  "$ruby" -rfiddle -e "puts \"fiddle: ok\""
+  "$ruby" -rreadline -e "puts \"readline: ok (#{defined?(Reline) ? \"reline\" : \"ext\"})\""
+  "$ruby" -rdigest/sha2 -rbigdecimal -rjson -rdate -rsocket -rpsych -e "puts \"stdlib: ok\""
+  "$ruby" -e "abort \"2**64 wrong\" unless (2**64).to_s == \"18446744073709551616\"; puts \"arithmetic: ok\""
+  "$dir/ruby-'"$version"'/bin/gem" install --no-document msgpack >/dev/null
+  "$ruby" -rmsgpack -e "abort \"msgpack\" unless MessagePack.unpack(MessagePack.pack({\"a\" => 1})) == {\"a\" => 1}; puts \"native gem: ok\""
+  "$dir/ruby-'"$version"'/bin/bundle" --version
+  echo "portable: ok"
+'
+
+echo ""
+echo "✓ dist/$artifact"

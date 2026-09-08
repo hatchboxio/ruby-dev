@@ -11,10 +11,19 @@ Available definitions:
 |---------|---------|---------|
 | 1.8.7-p374 | 1.0.2u | 1.17.3 |
 | 1.9.3-p551 | 1.0.2u | 1.17.3 |
+| 2.0.0-p648 | 1.0.2u | 1.17.3 |
+| 2.1.10 | 1.0.2u | 1.17.3 |
+| 2.2.10 | 1.0.2u | 1.17.3 |
 | 2.3.3 | 1.0.2u | 1.17.3 |
 | 2.3.8 | 1.0.2u | 1.17.3 |
+| 2.4.10 | 1.1.1w | 1.17.3 and 2.3.27 |
 | 2.5.9 | 1.1.1w | 1.17.3 and 2.3.27 |
+| 2.6.10 | 1.1.1w | 1.17.3 and 2.4.22 |
 | 2.7.8 | 1.1.1w | 1.17.3 and 2.4.22 |
+
+2.0.0-p648, 2.1.10, 2.2.10, 2.4.10, and 2.6.10 are built and tested on Ubuntu Resolute
+(26.04) only, on both amd64 and arm64. They may well work elsewhere, but nothing checks
+that; the others are tested on Ubuntu Noble and Arch, and on macOS by hand.
 
 Modern OpenSSL dropped the APIs these Rubies need, so each definition brings its own. On
 macOS the OpenSSL 1.0 builds come from [basecamp/homebrew-dev](https://github.com/basecamp/homebrew-dev);
@@ -137,6 +146,41 @@ RUBY_BUILD_DEFINITIONS="$PWD" ruby-build 1.8.7-p374 ~/.rubies/1.8.7-p374
 This is also the form to use with chruby or any other manager that just wants a directory
 of Rubies — build into its search path (`~/.rubies` for chruby) and it'll pick them up.
 
+### Portable tarballs
+
+A definition can also be built into a tarball that runs from wherever it is extracted, the
+way [jdx/ruby](https://github.com/jdx/ruby) does for current Rubies:
+
+```bash
+bin/portable 2.7.8 ubuntu-resolute-arm64   # -> dist/ruby-2.7.8.ubuntu-resolute-arm64.tar.gz
+bin/portable 2.7.8 ubuntu-resolute-amd64
+```
+
+Extract it anywhere and run `bin/ruby`; nothing needs to be installed on the host beyond
+glibc. Ruby is configured with `--enable-load-relative`, so it finds its own prefix from
+the executable, and OpenSSL, zlib, libyaml, and libffi are compiled in statically. Their
+headers and static libraries ship inside the prefix and rbconfig is rewritten to point at
+them, so native gems still build after relocation (given a compiler on the host). OpenSSL
+uses the host's `/etc/ssl/certs`; a host without one falls back to a bundled CA file.
+
+Everything version-specific — source URL and checksum, OpenSSL version, compiler flags,
+configure options, which bundlers to install — is read from the ruby-build definition, so
+the two builds can't drift apart. Extensions that would drag in a library nothing
+guarantees (gdbm, readline, tk) are left out; `require "readline"` still works via reline
+in 2.7.
+
+One caveat comes from RubyGems 3.1, the version 2.7 ships: it doesn't know about
+load-relative prefixes, so executables it installs get the absolute path of wherever the
+tree lives at the time. The stubs in the tarball are rewritten to be relative, and
+`gem install` on the extracted tree works normally, but gems installed after extracting
+tie the tree to that location — move it again and reinstall them.
+
+The build runs in the platform's Docker image. The result is then extracted at a random
+path inside a *fresh* Ubuntu image with a compiler and nothing else — no `-dev` packages,
+no `ca-certificates` — and has to load every bundled extension, fetch an https URL, and
+compile a native gem. A tarball built on Resolute runs on Resolute or anything with a
+newer glibc; to reach older distributions, build on the oldest one you need to support.
+
 ### A warning that applies to all of the above
 
 Whichever tool you use, the definitions are only found if ruby-build can actually see them:
@@ -186,10 +230,16 @@ is checked without touching your own toolchain. `bin/ci` runs it for you; use it
 when you want a specific slice.
 
 ```bash
-test/build arch 1.8.7-p374     # one version on one platform
-test/build ubuntu-noble all    # every version on one platform
-test/build all                 # everything
+test/build arch 1.8.7-p374            # one version on one platform
+test/build ubuntu-noble all           # every version on one platform
+test/build ubuntu-resolute-arm64 all  # a platform on a specific architecture
+test/build all                        # everything
 ```
+
+Platforms are `ubuntu-noble`, `ubuntu-resolute-amd64`, `ubuntu-resolute-arm64`, and
+`arch`. A definition that only targets some of them says so in a `# platforms:` comment on
+its first line, and `all` respects that; naming a platform and a version explicitly always
+runs the pair, so anything can still be tried anywhere.
 
 Builds run concurrently, so results stream in out of order and a sorted summary with any
 failure logs is printed at the end. Tune the load with `JOBS` (containers at a time,

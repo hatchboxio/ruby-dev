@@ -1,0 +1,70 @@
+# platforms: ubuntu-resolute-amd64 ubuntu-resolute-arm64
+
+# Old config.guess isn't arm64-aware, and unlike 2.3 there's no downloader.rb in these
+# sources to fetch a fresh one. Pull it in from automake or GNU instead, as 1.9.3 does.
+build_package_freshen_automake_config() {
+  {
+    if type -p brew >/dev/null; then
+      brew install automake
+      cp `brew --prefix automake`/share/automake-*/config.{guess,sub} tool/
+    elif [ -d /usr/share/automake-* ]; then
+      cp /usr/share/automake-*/config.{guess,sub} tool/
+    else
+      # Download directly from GNU Savannah
+      curl -fsSL -o tool/config.guess 'https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.guess;hb=HEAD'
+      curl -fsSL -o tool/config.sub 'https://git.savannah.gnu.org/gitweb/?p=config.git;a=blob_plain;f=config.sub;hb=HEAD'
+      chmod +x tool/config.{guess,sub}
+    fi
+  } >&4 2>&1
+}
+
+# -v rather than the bundler:1.17.3 shorthand: that syntax needs a newer RubyGems than
+# the one this Ruby ships with.
+install_bundler() {
+  "$PREFIX_PATH"/bin/gem install bundler -v 1.17.3
+}
+
+# -O3 because leaving this empty does not mean "use configure's default". ruby-build
+# exports it as CFLAGS, which supersedes configure's own optflags, so an empty value builds
+# at -O0 — measured 2-3x slower than the same source at -O3. (rbconfig still reports
+# optflags: -O3 in that case, which is misleading; the timings are what to trust.)
+#
+# -fno-strict-overflow guards the fixnum overflow checks in these old sources, which assume
+# signed overflow wraps — undefined behaviour that GCC exploits from -O2 up. On 1.8.7 its
+# absence silently makes 2**64 evaluate to 0. Kept uniform across every definition here;
+# it costs nothing measurable.
+RUBY_CFLAGS="-O3 -fno-strict-overflow"
+case "$(cc -v 2>&1)" in
+  *gcc*)
+    RUBY_CFLAGS+=" -Wno-discarded-qualifiers"
+    RUBY_CFLAGS+=" -Wno-implicit-int"
+    RUBY_CFLAGS+=" -Wno-incompatible-pointer-types"
+    RUBY_CFLAGS+=" -Wno-int-conversion"
+    RUBY_CFLAGS+=" -Wno-return-type"
+    # GCC 15 porting: Use -std=gnu99 with relaxed type checking
+    RUBY_CFLAGS+=" -std=gnu99 -Wno-error=implicit-function-declaration"
+    ;;
+  *clang*)
+    RUBY_CFLAGS+=" -Wno-compound-token-split-by-macro"
+    RUBY_CFLAGS+=" -Wno-implicit-function-declaration"
+    RUBY_CFLAGS+=" -Wno-implicit-int"
+    RUBY_CFLAGS+=" -Wno-incompatible-function-pointer-types"
+    RUBY_CFLAGS+=" -Wno-int-conversion"
+    RUBY_CFLAGS+=" -Wno-return-type"
+    ;;
+esac
+export RUBY_CFLAGS
+
+# M1-compatible OpenSSL 1.0 from https://github.com/basecamp/homebrew-dev
+if type -p brew >/dev/null; then
+  brew install basecamp/dev/openssl@1.0
+  openssl_prefix_path="$(brew --prefix basecamp/dev/openssl@1.0)"
+  package_option ruby configure --with-openssl-dir="$openssl_prefix_path"
+  export PKG_CONFIG_PATH="$openssl_prefix_path/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+else
+  install_package "openssl-1.0.2u" "https://www.openssl.org/source/openssl-1.0.2u.tar.gz#ecd0c6ffb493dd06707d38b14bb4d8c2288bb7033735606569d8f90f89669d16" openssl --if needs_openssl:0.9.6-1.0.x
+fi
+
+package_option ruby configure --with-out-ext=tk --disable-install-doc
+install_package "ruby-2.2.10" "https://cache.ruby-lang.org/pub/ruby/2.2/ruby-2.2.10.tar.bz2#a54204d2728283c9eff0cf81d654f245fa5b3447d0824f1a6bc3b2c5c827381e" freshen_automake_config standard
+install_bundler
