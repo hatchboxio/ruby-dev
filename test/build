@@ -6,7 +6,27 @@ cd "$(dirname "$0")/.."
 # Docker platforms only. `native` is a platform too, but it is opt-in by name and
 # deliberately not in here: `test/build all` must stay a clean-room test, and a native
 # build compiles against whatever the host happens to have installed.
-PLATFORMS="ubuntu-noble arch"
+#
+# A platform name may carry an -amd64 or -arm64 suffix. The suffix picks the container
+# architecture; the rest names the dockerfile. Without one the container runs on the host's
+# architecture (arch is the exception: it is amd64 only, see platform_for).
+PLATFORMS="ubuntu-noble ubuntu-resolute-amd64 ubuntu-resolute-arm64 arch"
+
+# Not every definition is built on every platform. A definition opts into a narrower set
+# with a comment line:
+#
+#   # platforms: ubuntu-resolute-amd64 ubuntu-resolute-arm64
+#
+# `all` honours these declarations; naming a platform and a version explicitly does not,
+# so a definition can still be tried anywhere by hand. A definition that declares nothing
+# gets DEFAULT_PLATFORMS — the matrix as it was before any definition needed narrowing.
+DEFAULT_PLATFORMS="ubuntu-noble arch"
+
+platforms_for_version() {
+  local declared
+  declared=$(sed -n 's/^# platforms:[[:space:]]*//p' "$1" | head -1)
+  echo "${declared:-$DEFAULT_PLATFORMS}"
+}
 
 # macOS ships BSD sort, which rejects -V. Fall back to plain sort there rather than dying
 # on an unsupported flag — the order is cosmetic, it only sets which builds start first.
@@ -74,9 +94,19 @@ NATIVE_PLATFORM="linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
 
 platform_for() {
   case $1 in
-    arch) echo "linux/amd64" ;;
-    *)    echo "$NATIVE_PLATFORM" ;;
+    *-amd64) echo "linux/amd64" ;;
+    *-arm64) echo "linux/arm64" ;;
+    arch)    echo "linux/amd64" ;;
+    *)       echo "$NATIVE_PLATFORM" ;;
   esac
+}
+
+# ubuntu-resolute-amd64 and ubuntu-resolute-arm64 share test/ubuntu-resolute.dockerfile.
+dockerfile_for() {
+  local name=$1
+  name=${name%-amd64}
+  name=${name%-arm64}
+  echo "test/${name}.dockerfile"
 }
 
 build_image() {
@@ -85,7 +115,8 @@ build_image() {
   # Nothing to build for a host build.
   [[ $platform == native ]] && return 0
 
-  local dockerfile="test/${platform}.dockerfile"
+  local dockerfile
+  dockerfile=$(dockerfile_for "$platform")
   local image="ruby-build-test:${platform}"
   local target_platform
   target_platform=$(platform_for "$platform")
@@ -184,7 +215,7 @@ docker_build() {
 # arithmetic assertion answers.
 #
 # Both the prefix and ruby-build's scratch/log directory are removed as soon as the build
-# has been judged. A full matrix is six Rubies and several GB, and the machines that need
+# has been judged. A full matrix is eleven Rubies and several GB, and the machines that need
 # this test are laptops.
 native_build() {
   local version=$1
@@ -266,7 +297,7 @@ version=${2:-all}
 for p in $platforms; do
   case $p in
     native) ;;
-    *) [[ ! -f "test/${p}.dockerfile" ]] && { echo "Unknown platform: $p"; exit 1; } ;;
+    *) [[ ! -f "$(dockerfile_for "$p")" ]] && { echo "Unknown platform: $p"; exit 1; } ;;
   esac
 done
 
@@ -310,47 +341,65 @@ for v in $versions; do
   [[ ! -f "$v" ]] && { echo "Unknown version: $v"; exit 1; }
 done
 
-# Build images
+# Expand to the (platform, version) pairs that will actually run. `all` on either side
+# means "all declared", so a version's `# platforms:` line filters the pairs; naming both
+# explicitly runs exactly that pair.
+builds=()
 for p in $platforms; do
-  build_image "$p"
+  for v in $versions; do
+    # native is never declared and never filtered: it's opt-in by name, and the point of
+    # it is to try any definition on this host.
+    if [[ $p != native && ( $platform == all || $version == all ) ]]; then
+      case " $(platforms_for_version "$v") " in
+        *" $p "*) ;;
+        *) continue ;;
+      esac
+    fi
+    builds+=("$p $v")
+  done
+done
+[[ ${#builds[@]} -gt 0 ]] || { echo "error: nothing to build — no definition declares any of: $platforms" >&2; exit 1; }
+
+# Build images, only for platforms that have something to run on them.
+for p in $platforms; do
+  case " ${builds[*]} " in
+    *" $p "*) build_image "$p" ;;
+  esac
 done
 
 # Run tests, up to $JOBS at a time
 RESULTS=$(mktemp -d)
 trap 'rm -rf "$RESULTS"' EXIT
 
-total=0
-for p in $platforms; do for v in $versions; do total=$(( total + 1 )); done; done
+total=${#builds[@]}
 
 echo ""
 echo "Running $total build(s), $JOBS at a time (make -j$MAKE_JOBS each)..."
 echo ""
 
-for p in $platforms; do
-  for v in $versions; do
-    # Throttle: wait for a slot before launching the next build. `wait -n` would be
-    # tidier but needs Bash 4.3, and macOS still ships 3.2 as /bin/bash — there it
-    # fails instantly and spins the loop on a core. Poll instead; builds run for
-    # minutes, so a second of latency costs nothing.
-    while (( $(jobs -rp | wc -l) >= JOBS )); do
-      sleep 1
-    done
-    test_ruby "$p" "$v" &
+for build in "${builds[@]}"; do
+  # Throttle: wait for a slot before launching the next build. `wait -n` would be
+  # tidier but needs Bash 4.3, and macOS still ships 3.2 as /bin/bash — there it
+  # fails instantly and spins the loop on a core. Poll instead; builds run for
+  # minutes, so a second of latency costs nothing.
+  while (( $(jobs -rp | wc -l) >= JOBS )); do
+    sleep 1
   done
+  # shellcheck disable=SC2086
+  test_ruby $build &
 done
 wait
 
 # Summarize in stable order, since results streamed in as they finished.
 failed=0
-for p in $platforms; do
-  for v in $versions; do
-    if [[ $(cat "$RESULTS/$p.$v.status" 2>/dev/null) != "pass" ]]; then
-      failed=$(( failed + 1 ))
-      echo ""
-      echo "=== $p $v failed ==="
-      cat "$RESULTS/$p.$v.log" 2>/dev/null || echo "(no output captured)"
-    fi
-  done
+for build in "${builds[@]}"; do
+  p=${build% *}; v=${build#* }
+  if [[ $(cat "$RESULTS/$p.$v.status" 2>/dev/null) != "pass" ]]; then
+    failed=$(( failed + 1 ))
+    echo ""
+    echo "=== $p $v failed ==="
+    cat "$RESULTS/$p.$v.log" 2>/dev/null || echo "(no output captured)"
+  fi
 done
 
 echo ""
